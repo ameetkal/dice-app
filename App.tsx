@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Alert,
   Animated,
+  FlatList,
+  KeyboardAvoidingView,
   Linking,
   Modal,
   Platform,
@@ -8,6 +11,7 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -17,7 +21,67 @@ import * as Haptics from 'expo-haptics';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 const STORAGE_KEY = '@dice_app_settings_v1';
+const LOGS_KEY = '@dice_app_roll_logs_v1';
 const SITE_URL = 'https://dicetheory.org';
+
+type RollLogEntry = {
+  id: string;
+  createdAt: string;
+  description: string;
+  outcomeSummary: string;
+  people: string[];
+};
+
+function newLogId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function buildOutcomeSummary(
+  numDice: number,
+  sides: number,
+  vals: number[],
+): string {
+  const vs = vals.join(', ');
+  const prefix = `${numDice}d${sides}`;
+  if (numDice > 1) {
+    const t = vals.reduce((a, b) => a + b, 0);
+    return `${prefix} · ${vs} · total ${t}`;
+  }
+  return `${prefix} · ${vs}`;
+}
+
+function parsePeople(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function isValidLogEntry(x: unknown): x is RollLogEntry {
+  if (!x || typeof x !== 'object') return false;
+  const o = x as Record<string, unknown>;
+  return (
+    typeof o.id === 'string' &&
+    typeof o.createdAt === 'string' &&
+    typeof o.description === 'string' &&
+    typeof o.outcomeSummary === 'string' &&
+    Array.isArray(o.people) &&
+    o.people.every((p) => typeof p === 'string')
+  );
+}
+
+function formatLogTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+}
 
 /** Standard polyhedral set — common for tabletop / RPG. */
 const SIDES_OPTIONS = [4, 6, 8, 10, 12, 20] as const;
@@ -180,20 +244,44 @@ function parseStored(raw: string | null): Partial<StoredSettings> | null {
 
 export default function App() {
   const [settingsReady, setSettingsReady] = useState(false);
+  const [logsHydrated, setLogsHydrated] = useState(false);
+  const [screen, setScreen] = useState<'main' | 'history'>('main');
   const [numDice, setNumDice] = useState(1);
   const [sides, setSides] = useState<number>(6);
   const [values, setValues] = useState<number[] | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [logs, setLogs] = useState<RollLogEntry[]>([]);
+
+  const [logModalOpen, setLogModalOpen] = useState(false);
+  const [editingLogId, setEditingLogId] = useState<string | null>(null);
+  const [logOutcomeSummary, setLogOutcomeSummary] = useState('');
+  const [logDescription, setLogDescription] = useState('');
+  const [logPeople, setLogPeople] = useState('');
 
   const spin = useRef(new Animated.Value(0)).current;
   const scale = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
     void (async () => {
-      const parsed = parseStored(await AsyncStorage.getItem(STORAGE_KEY));
+      const [settingsRaw, logsRaw] = await Promise.all([
+        AsyncStorage.getItem(STORAGE_KEY),
+        AsyncStorage.getItem(LOGS_KEY),
+      ]);
+      const parsed = parseStored(settingsRaw);
       if (parsed?.numDice != null) setNumDice(parsed.numDice);
       if (parsed?.sides != null) setSides(parsed.sides);
+      if (logsRaw) {
+        try {
+          const arr = JSON.parse(logsRaw) as unknown;
+          if (Array.isArray(arr)) {
+            setLogs(arr.filter(isValidLogEntry));
+          }
+        } catch {
+          /* ignore */
+        }
+      }
       setSettingsReady(true);
+      setLogsHydrated(true);
     })();
   }, []);
 
@@ -204,6 +292,20 @@ export default function App() {
       JSON.stringify({ numDice, sides } satisfies StoredSettings),
     );
   }, [numDice, sides, settingsReady]);
+
+  useEffect(() => {
+    if (!logsHydrated) return;
+    void AsyncStorage.setItem(LOGS_KEY, JSON.stringify(logs));
+  }, [logs, logsHydrated]);
+
+  const sortedLogs = useMemo(
+    () =>
+      [...logs].sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      ),
+    [logs],
+  );
 
   useEffect(() => {
     setValues(null);
@@ -258,6 +360,86 @@ export default function App() {
     }
   }, [animateRoll, numDice, sides]);
 
+  const closeLogModal = useCallback(() => {
+    setLogModalOpen(false);
+    setEditingLogId(null);
+    setLogDescription('');
+    setLogPeople('');
+    setLogOutcomeSummary('');
+  }, []);
+
+  const openLogCreate = useCallback(() => {
+    if (!values?.length) return;
+    setEditingLogId(null);
+    setLogOutcomeSummary(buildOutcomeSummary(numDice, sides, values));
+    setLogDescription('');
+    setLogPeople('');
+    setLogModalOpen(true);
+  }, [numDice, sides, values]);
+
+  const openLogEdit = useCallback((entry: RollLogEntry) => {
+    setEditingLogId(entry.id);
+    setLogOutcomeSummary(entry.outcomeSummary);
+    setLogDescription(entry.description);
+    setLogPeople(entry.people.join(', '));
+    setLogModalOpen(true);
+  }, []);
+
+  const saveLog = useCallback(() => {
+    const peopleArr = parsePeople(logPeople);
+    if (editingLogId) {
+      setLogs((prev) =>
+        prev.map((e) =>
+          e.id === editingLogId
+            ? {
+                ...e,
+                description: logDescription.trim(),
+                people: peopleArr,
+              }
+            : e,
+        ),
+      );
+    } else {
+      const entry: RollLogEntry = {
+        id: newLogId(),
+        createdAt: new Date().toISOString(),
+        description: logDescription.trim(),
+        outcomeSummary: logOutcomeSummary,
+        people: peopleArr,
+      };
+      setLogs((prev) => [entry, ...prev]);
+    }
+    if (Platform.OS !== 'web') {
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }
+    closeLogModal();
+  }, [
+    closeLogModal,
+    editingLogId,
+    logDescription,
+    logOutcomeSummary,
+    logPeople,
+  ]);
+
+  const confirmDeleteLog = useCallback(() => {
+    if (!editingLogId) return;
+    Alert.alert(
+      'Delete entry?',
+      'This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            setLogs((prev) => prev.filter((e) => e.id !== editingLogId));
+            closeLogModal();
+          },
+        },
+      ],
+    );
+  }, [closeLogModal, editingLogId]);
+
   const spinInterpolate = spin.interpolate({
     inputRange: [0, 1],
     outputRange: ['0deg', '18deg'],
@@ -278,85 +460,264 @@ export default function App() {
     <SafeAreaProvider>
       <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
         <StatusBar style="light" />
-        <View style={styles.topBar}>
-          <Pressable
-            onPress={() => setSettingsOpen(true)}
-            style={({ pressed }) => [
-              styles.settingsBtn,
-              pressed && styles.settingsBtnPressed,
-            ]}
-            hitSlop={12}
-            accessibilityRole="button"
-            accessibilityLabel="Settings"
-          >
-            <Ionicons name="settings-outline" size={26} color={ACCENT} />
-          </Pressable>
-        </View>
-        <View style={styles.inner}>
-          <View style={styles.titleBlock}>
-            <Text style={styles.title}>{title}</Text>
-            <Text style={styles.configHint}>{configLabel}</Text>
-          </View>
-
-          <Pressable
-            onPress={onRoll}
-            accessibilityRole="button"
-            accessibilityLabel={`Roll ${numDice} ${numDice === 1 ? 'die' : 'dice'}, ${sides} sides each`}
-            style={({ pressed }) => [pressed && styles.pressed]}
-          >
-            <Animated.View
-              style={[
-                styles.diceWrap,
-                {
-                  transform: [{ rotate: spinInterpolate }, { scale }],
-                },
-              ]}
-            >
-              <View
-                style={[
-                  styles.diceGrid,
-                  { gap: dieGap, marginHorizontal: -dieGap / 2 },
+        {screen === 'main' ? (
+          <>
+            <View style={styles.topBar}>
+              <Pressable
+                onPress={() => setScreen('history')}
+                style={({ pressed }) => [
+                  styles.iconBtn,
+                  pressed && styles.iconBtnPressed,
                 ]}
+                hitSlop={12}
+                accessibilityRole="button"
+                accessibilityLabel="Roll log"
               >
-                {slotValues.map((v, i) => (
-                  <View key={i} style={{ marginHorizontal: dieGap / 2 }}>
-                    <DieTile value={v} size={dieSize} sides={sides} />
-                  </View>
-                ))}
+                <Ionicons name="list-outline" size={26} color={ACCENT} />
+              </Pressable>
+              <Pressable
+                onPress={() => setSettingsOpen(true)}
+                style={({ pressed }) => [
+                  styles.iconBtn,
+                  pressed && styles.iconBtnPressed,
+                ]}
+                hitSlop={12}
+                accessibilityRole="button"
+                accessibilityLabel="Settings"
+              >
+                <Ionicons name="settings-outline" size={26} color={ACCENT} />
+              </Pressable>
+            </View>
+            <View style={styles.inner}>
+              <View style={styles.titleBlock}>
+                <Text style={styles.title}>{title}</Text>
+                <Text style={styles.configHint}>{configLabel}</Text>
               </View>
-            </Animated.View>
-          </Pressable>
 
-          {total != null ? (
-            <Text style={styles.totalLine}>Total: {total}</Text>
-          ) : (
-            <View style={styles.totalPlaceholder} />
-          )}
+              <Pressable
+                onPress={onRoll}
+                accessibilityRole="button"
+                accessibilityLabel={`Roll ${numDice} ${numDice === 1 ? 'die' : 'dice'}, ${sides} sides each`}
+                style={({ pressed }) => [pressed && styles.pressed]}
+              >
+                <Animated.View
+                  style={[
+                    styles.diceWrap,
+                    {
+                      transform: [{ rotate: spinInterpolate }, { scale }],
+                    },
+                  ]}
+                >
+                  <View
+                    style={[
+                      styles.diceGrid,
+                      { gap: dieGap, marginHorizontal: -dieGap / 2 },
+                    ]}
+                  >
+                    {slotValues.map((v, i) => (
+                      <View key={i} style={{ marginHorizontal: dieGap / 2 }}>
+                        <DieTile value={v} size={dieSize} sides={sides} />
+                      </View>
+                    ))}
+                  </View>
+                </Animated.View>
+              </Pressable>
 
-          <Pressable
-            onPress={onRoll}
-            style={({ pressed }) => [
-              styles.rollButton,
-              pressed && styles.rollButtonPressed,
-            ]}
-            accessibilityRole="button"
-            accessibilityLabel="Roll again"
-          >
-            <Text style={styles.rollLabel}>Roll</Text>
-          </Pressable>
-        </View>
+              {values ? (
+                total != null ? (
+                  <Text style={styles.totalLine}>Total: {total}</Text>
+                ) : (
+                  <View style={styles.totalSpacerSmall} />
+                )
+              ) : (
+                <View style={styles.totalPlaceholder} />
+              )}
 
-        <Pressable
-          onPress={() => void Linking.openURL(SITE_URL)}
-          style={({ pressed }) => [
-            styles.siteFooter,
-            pressed && styles.siteFooterPressed,
-          ]}
-          accessibilityRole="link"
-          accessibilityHint="Opens in your browser"
+              {values ? (
+                <Pressable
+                  onPress={openLogCreate}
+                  style={({ pressed }) => [
+                    styles.logThisRollBtn,
+                    pressed && styles.logThisRollBtnPressed,
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Log this roll"
+                >
+                  <Text style={styles.logThisRollText}>Log this roll</Text>
+                </Pressable>
+              ) : null}
+
+              <Pressable
+                onPress={onRoll}
+                style={({ pressed }) => [
+                  styles.rollButton,
+                  pressed && styles.rollButtonPressed,
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel="Roll again"
+              >
+                <Text style={styles.rollLabel}>Roll</Text>
+              </Pressable>
+            </View>
+
+            <Pressable
+              onPress={() => void Linking.openURL(SITE_URL)}
+              style={({ pressed }) => [
+                styles.siteFooter,
+                pressed && styles.siteFooterPressed,
+              ]}
+              accessibilityRole="link"
+              accessibilityHint="Opens in your browser"
+            >
+              <Text style={styles.siteFooterText}>dicetheory.org</Text>
+            </Pressable>
+          </>
+        ) : (
+          <>
+            <View style={styles.topBarHistory}>
+              <Pressable
+                onPress={() => setScreen('main')}
+                style={({ pressed }) => [
+                  styles.historyBackBtn,
+                  pressed && styles.historyBackPressed,
+                ]}
+                hitSlop={12}
+                accessibilityRole="button"
+                accessibilityLabel="Back"
+              >
+                <Ionicons name="chevron-back" size={28} color={DIE} />
+              </Pressable>
+              <Text style={styles.historyHeaderTitle}>Roll log</Text>
+              <View style={styles.topBarHistorySpacer} />
+            </View>
+            <FlatList
+              style={styles.historyList}
+              contentContainerStyle={styles.historyListContent}
+              data={sortedLogs}
+              keyExtractor={(item) => item.id}
+              keyboardShouldPersistTaps="handled"
+              ListEmptyComponent={
+                <Text style={styles.historyEmpty}>
+                  No entries yet. Roll the dice, then use Log this roll to add one.
+                </Text>
+              }
+              renderItem={({ item }) => (
+                <Pressable
+                  onPress={() => openLogEdit(item)}
+                  style={({ pressed }) => [
+                    styles.logCard,
+                    pressed && styles.logCardPressed,
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityHint="Open to edit"
+                >
+                  <Text style={styles.logCardTime}>
+                    {formatLogTime(item.createdAt)}
+                  </Text>
+                  <Text style={styles.logCardDesc} numberOfLines={3}>
+                    {item.description.trim() || 'No description'}
+                  </Text>
+                  <Text style={styles.logCardOutcome}>{item.outcomeSummary}</Text>
+                  {item.people.length > 0 ? (
+                    <Text style={styles.logCardPeople} numberOfLines={2}>
+                      {item.people.join(' · ')}
+                    </Text>
+                  ) : null}
+                </Pressable>
+              )}
+            />
+          </>
+        )}
+
+        <Modal
+          visible={logModalOpen}
+          animationType="slide"
+          transparent
+          onRequestClose={closeLogModal}
         >
-          <Text style={styles.siteFooterText}>dicetheory.org</Text>
-        </Pressable>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.keyboardAvoid}
+          >
+            <View style={styles.modalOverlay}>
+              <Pressable
+                style={styles.modalBackdrop}
+                onPress={closeLogModal}
+                accessibilityRole="button"
+                accessibilityLabel="Close log"
+              />
+              <SafeAreaView edges={['bottom']} style={styles.modalSheet}>
+                <ScrollView
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator={false}
+                  contentContainerStyle={styles.logSheetScroll}
+                >
+                  <View style={styles.modalHandle} />
+                  <Text style={styles.modalTitle}>
+                    {editingLogId ? 'Edit log entry' : 'Log this roll'}
+                  </Text>
+                  <Text style={styles.sectionLabel}>Roll</Text>
+                  <Text style={styles.outcomeReadonly}>{logOutcomeSummary}</Text>
+
+                  <Text style={styles.sectionLabel}>What was it for?</Text>
+                  <TextInput
+                    value={logDescription}
+                    onChangeText={setLogDescription}
+                    placeholder="Short description (optional)"
+                    placeholderTextColor="rgba(138, 145, 153, 0.7)"
+                    style={[styles.textInput, styles.textInputMultiline]}
+                    multiline
+                  />
+
+                  <Text style={styles.sectionLabel}>People</Text>
+                  <TextInput
+                    value={logPeople}
+                    onChangeText={setLogPeople}
+                    placeholder="Comma-separated names (optional)"
+                    placeholderTextColor="rgba(138, 145, 153, 0.7)"
+                    style={styles.textInput}
+                    autoCapitalize="words"
+                    autoCorrect
+                  />
+
+                  {editingLogId ? (
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.deleteLogButton,
+                        pressed && styles.deleteLogButtonPressed,
+                      ]}
+                      onPress={confirmDeleteLog}
+                      accessibilityRole="button"
+                      accessibilityLabel="Delete log entry"
+                    >
+                      <Text style={styles.deleteLogLabel}>Delete entry</Text>
+                    </Pressable>
+                  ) : null}
+
+                  <Pressable
+                    style={({ pressed }) => [
+                      styles.doneButton,
+                      pressed && styles.doneButtonPressed,
+                    ]}
+                    onPress={saveLog}
+                    accessibilityRole="button"
+                    accessibilityLabel="Save log entry"
+                  >
+                    <Text style={styles.doneLabel}>Save</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={closeLogModal}
+                    style={styles.cancelLink}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cancel"
+                  >
+                    <Text style={styles.cancelLinkText}>Cancel</Text>
+                  </Pressable>
+                </ScrollView>
+              </SafeAreaView>
+            </View>
+          </KeyboardAvoidingView>
+        </Modal>
 
         <Modal
           visible={settingsOpen}
@@ -467,12 +828,109 @@ const styles = StyleSheet.create({
   topBar: {
     width: '100%',
     flexDirection: 'row',
-    justifyContent: 'flex-end',
+    justifyContent: 'space-between',
     alignItems: 'center',
     paddingLeft: 16,
     paddingRight: 16,
     paddingTop: 4,
     paddingBottom: 4,
+  },
+  topBarHistory: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingLeft: 8,
+    paddingRight: 16,
+    paddingTop: 4,
+    paddingBottom: 8,
+  },
+  historyBackBtn: {
+    width: 44,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 12,
+  },
+  historyBackPressed: {
+    opacity: 0.75,
+  },
+  historyHeaderTitle: {
+    flex: 1,
+    textAlign: 'center',
+    fontSize: 18,
+    fontWeight: '700',
+    color: DIE,
+  },
+  topBarHistorySpacer: {
+    width: 44,
+  },
+  historyList: {
+    flex: 1,
+    width: '100%',
+  },
+  historyListContent: {
+    paddingHorizontal: 24,
+    paddingBottom: 24,
+  },
+  historyEmpty: {
+    textAlign: 'center',
+    marginTop: 48,
+    fontSize: 16,
+    lineHeight: 24,
+    color: MUTED,
+    paddingHorizontal: 16,
+  },
+  logCard: {
+    backgroundColor: '#151c24',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#2a3340',
+    padding: 16,
+    marginBottom: 12,
+  },
+  logCardPressed: {
+    opacity: 0.92,
+    borderColor: 'rgba(201, 162, 39, 0.35)',
+  },
+  logCardTime: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: MUTED,
+    marginBottom: 8,
+  },
+  logCardDesc: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: DIE,
+    marginBottom: 8,
+    lineHeight: 22,
+  },
+  logCardOutcome: {
+    fontSize: 14,
+    color: MUTED,
+    fontVariant: ['tabular-nums'],
+    marginBottom: 6,
+  },
+  logCardPeople: {
+    fontSize: 13,
+    color: 'rgba(138, 145, 153, 0.9)',
+  },
+  iconBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2a3340',
+    backgroundColor: '#151c24',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  iconBtnPressed: {
+    opacity: 0.85,
+    borderColor: ACCENT,
+  },
+  keyboardAvoid: {
+    flex: 1,
   },
   inner: {
     flex: 1,
@@ -499,20 +957,6 @@ const styles = StyleSheet.create({
     color: MUTED,
     fontWeight: '500',
     textAlign: 'center',
-  },
-  settingsBtn: {
-    width: 48,
-    height: 48,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#2a3340',
-    backgroundColor: '#151c24',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  settingsBtnPressed: {
-    opacity: 0.85,
-    borderColor: ACCENT,
   },
   siteFooter: {
     alignSelf: 'center',
@@ -585,6 +1029,86 @@ const styles = StyleSheet.create({
   totalPlaceholder: {
     height: 34,
     marginBottom: 16,
+  },
+  totalSpacerSmall: {
+    height: 8,
+    marginBottom: 16,
+  },
+  logThisRollBtn: {
+    borderWidth: 1,
+    borderColor: 'rgba(201, 162, 39, 0.45)',
+    paddingVertical: 12,
+    paddingHorizontal: 22,
+    borderRadius: 12,
+    marginBottom: 16,
+    backgroundColor: 'transparent',
+  },
+  logThisRollBtnPressed: {
+    opacity: 0.88,
+    backgroundColor: 'rgba(201, 162, 39, 0.08)',
+  },
+  logThisRollText: {
+    color: ACCENT,
+    opacity: 0.82,
+    fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  logSheetScroll: {
+    paddingBottom: 24,
+  },
+  outcomeReadonly: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: DIE,
+    backgroundColor: BG,
+    borderWidth: 1,
+    borderColor: '#2a3340',
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 20,
+    fontVariant: ['tabular-nums'],
+  },
+  textInput: {
+    backgroundColor: BG,
+    borderWidth: 1,
+    borderColor: '#2a3340',
+    borderRadius: 12,
+    padding: 14,
+    color: DIE,
+    fontSize: 16,
+    marginBottom: 20,
+  },
+  textInputMultiline: {
+    minHeight: 96,
+    textAlignVertical: 'top',
+  },
+  deleteLogButton: {
+    marginBottom: 12,
+    paddingVertical: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(180, 90, 90, 0.5)',
+    alignItems: 'center',
+    backgroundColor: 'rgba(80, 40, 40, 0.25)',
+  },
+  deleteLogButtonPressed: {
+    opacity: 0.85,
+  },
+  deleteLogLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#d88a8a',
+  },
+  cancelLink: {
+    alignItems: 'center',
+    paddingVertical: 14,
+    marginTop: 4,
+  },
+  cancelLinkText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: MUTED,
   },
   pressed: {
     opacity: 0.92,
