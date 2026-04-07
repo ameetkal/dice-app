@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "Dice Roll",
-    "slug": "dice-app",
+    "name": "Dice",
+    "slug": "dice-theory",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -14,10 +14,13 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.yourname.diceroll"
+      "bundleIdentifier": "com.rex.dice-theory",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
-      "package": "com.yourname.diceroll",
+      "package": "com.rex.dice-theory",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0f1419"
@@ -27,6 +30,12 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "8aa67bc1-c7f1-4a82-9917-af772a43d6e2"
+      }
+    },
+    "owner": "ameetkal"
   }
 }

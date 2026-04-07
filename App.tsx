@@ -598,7 +598,7 @@ export default function App() {
               keyboardShouldPersistTaps="handled"
               ListEmptyComponent={
                 <Text style={styles.historyEmpty}>
-                  No entries yet. Roll the dice, then use Log this roll to add one.
+                  No entries yet. Roll the dice, then tap “Log this roll” to add one.
                 </Text>
               }
               renderItem={({ item }) => (
